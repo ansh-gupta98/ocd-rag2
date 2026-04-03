@@ -1,0 +1,13 @@
+OCD — clinical overview (for RAG retrieval; not a substitute for professional care)
+
+Obsessive-compulsive disorder (OCD) involves unwanted intrusive thoughts, images, or urges (obsessions) and/or repetitive behaviors or mental acts (compulsions) aimed at reducing distress or preventing a feared outcome.
+
+Common themes include contamination, symmetry/order, harm, sexual or religious concerns, and “not just right” sensations. Functional impairment and time spent on rituals are key clinical considerations.
+
+Evidence-based treatments
+- Cognitive behavioral therapy (CBT), especially Exposure and Response Prevention (ERP), is a first-line psychological treatment.
+- Response prevention means resisting rituals while anxiety is tolerated and habituates over time.
+- Medication decisions belong to a qualified prescriber; this document does not give dosing or drug advice.
+
+Safety
+- If there is imminent risk of self-harm or harm to others, seek emergency services or local crisis resources immediately.
