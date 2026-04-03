@@ -1,22 +1,15 @@
 """
-OCD RAG Support – FastAPI backend v2.3
-Memory fix: replaced sentence-transformers (500MB+) with TF-IDF keyword retrieval.
-Runs comfortably within Railway's 512 MB default RAM limit.
-
-RAM budget:
-  - Python + FastAPI/uvicorn : ~100 MB
-  - 6318 chunk TF-IDF index  : ~15  MB
-  - httpx + numpy            : ~20  MB
-  - Total                    : ~135 MB  (well under 512 MB)
+OCD RAG Support – FastAPI backend v2.2
+Fixes:
+  - HF embedding API 410 Gone (api-inference.huggingface.co deprecated)
+  - 6318 chunk startup timeout — embeddings now run locally via sentence-transformers
+  - LLM still calls HF router API (no GPU needed for inference)
 """
 
 import os
-import math
-import re
-from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
@@ -25,12 +18,15 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 import httpx
 from pypdf import PdfReader
+from sentence_transformers import SentenceTransformer
 
 load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 HF_TOKEN       = os.getenv("HUGGINGFACEHUB_API_TOKEN") or os.getenv("HF_TOKEN", "")
 HF_LLM_REPO_ID = os.getenv("HF_LLM_REPO_ID", "meta-llama/Llama-3.1-8B-Instruct")
+# all-MiniLM-L6-v2 is ~90 MB — runs fine on Railway CPU, no GPU needed
+EMBED_MODEL_ID = os.getenv("HF_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 MAX_INPUT_CHARS = 3500
 
 HF_HEADERS = {
@@ -65,77 +61,30 @@ class SummaryResponse(BaseModel):
     summary_text: str
     message_count: int
 
-# ── TF-IDF retriever (zero extra deps, ~15 MB for 6k chunks) ─────────────────
+# ── Local embedding model (loaded once at startup, ~90 MB) ────────────────────
+# Runs on CPU. No HF API quota consumed for embeddings.
 
-def _tokenize(text: str) -> List[str]:
-    """Lowercase, strip punctuation, split on whitespace."""
-    return re.findall(r"[a-z0-9]+", text.lower())
+_embed_model: Optional[SentenceTransformer] = None
 
+def get_embed_model() -> SentenceTransformer:
+    global _embed_model
+    if _embed_model is None:
+        print(f"Loading local embedding model: {EMBED_MODEL_ID}")
+        _embed_model = SentenceTransformer(EMBED_MODEL_ID)
+        print("Embedding model loaded.")
+    return _embed_model
 
-class TFIDFStore:
-    def __init__(self):
-        self.chunks: List[str] = []
-        # term -> {doc_index -> tf score}
-        self._tf: List[Dict[str, float]] = []
-        # term -> idf score
-        self._idf: Dict[str, float] = {}
+def embed_texts(texts: List[str]) -> np.ndarray:
+    """Embed a list of texts locally. Returns (N, D) float32 array."""
+    model = get_embed_model()
+    vecs = model.encode(texts, batch_size=64, show_progress_bar=False, normalize_embeddings=True)
+    return np.array(vecs, dtype=np.float32)
 
-    def is_ready(self) -> bool:
-        return len(self.chunks) > 0
-
-    def build(self, chunks: List[str]) -> None:
-        self.chunks = chunks
-        n = len(chunks)
-        df: Dict[str, int] = defaultdict(int)
-
-        # Compute TF per document and DF per term
-        self._tf = []
-        for doc in chunks:
-            tokens = _tokenize(doc)
-            freq: Dict[str, int] = defaultdict(int)
-            for t in tokens:
-                freq[t] += 1
-            total = max(len(tokens), 1)
-            tf = {t: c / total for t, c in freq.items()}
-            self._tf.append(tf)
-            for t in tf:
-                df[t] += 1
-
-        # IDF with smoothing
-        self._idf = {
-            t: math.log((n + 1) / (cnt + 1)) + 1
-            for t, cnt in df.items()
-        }
-        print(f"TF-IDF index built: {n} chunks, {len(self._idf)} unique terms")
-
-    def search(self, query: str, k: int = 4) -> List[str]:
-        if not self.is_ready():
-            return []
-        q_tokens = _tokenize(query)
-        scores: Dict[int, float] = defaultdict(float)
-        for t in q_tokens:
-            idf = self._idf.get(t, 0.0)
-            if idf == 0:
-                continue
-            for idx, tf_doc in enumerate(self._tf):
-                tf = tf_doc.get(t, 0.0)
-                if tf > 0:
-                    scores[idx] += tf * idf
-
-        # Return top-k by score
-        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        return [self.chunks[i] for i, _ in ranked[:k]]
-
-
-knowledge_store = TFIDFStore()
-
-# ── HuggingFace LLM (remote API — no local model needed) ─────────────────────
+# ── HuggingFace LLM helper (remote API) ──────────────────────────────────────
+# Updated to new router.huggingface.co endpoint — api-inference.huggingface.co is deprecated.
 
 async def _hf_chat(system: str, user: str, max_new_tokens: int = 512) -> str:
-    url = (
-        f"https://router.huggingface.co/hf-inference/models"
-        f"/{HF_LLM_REPO_ID}/v1/chat/completions"
-    )
+    url = f"https://router.huggingface.co/hf-inference/models/{HF_LLM_REPO_ID}/v1/chat/completions"
     payload = {
         "model": HF_LLM_REPO_ID,
         "messages": [
@@ -151,10 +100,38 @@ async def _hf_chat(system: str, user: str, max_new_tokens: int = 512) -> str:
         data = resp.json()
     return data["choices"][0]["message"]["content"].strip()
 
+# ── Tiny local vector store ───────────────────────────────────────────────────
+
+class TinyVectorStore:
+    def __init__(self):
+        self.chunks: List[str] = []
+        self.matrix: Optional[np.ndarray] = None   # (N, D) normalized float32
+
+    def is_ready(self) -> bool:
+        return self.matrix is not None and len(self.chunks) > 0
+
+    def build(self, chunks: List[str]):
+        """Synchronous — called once at startup before the event loop is busy."""
+        self.chunks = chunks
+        print(f"Embedding {len(chunks)} chunks locally (CPU)...")
+        self.matrix = embed_texts(chunks)
+        print(f"Vector store built: {self.matrix.shape}")
+
+    def search(self, query: str, k: int = 4) -> List[str]:
+        if not self.is_ready():
+            return []
+        q = embed_texts([query])[0]          # already normalized
+        scores = self.matrix @ q
+        indices = np.argsort(scores)[::-1][:k].tolist()
+        return [self.chunks[i] for i in indices]
+
+
+knowledge_store = TinyVectorStore()
+
 # ── Document loaders ──────────────────────────────────────────────────────────
 
 def _extract_pdf_text(pdf_path: Path) -> str:
-    parts: List[str] = []
+    text_parts: List[str] = []
     try:
         reader = PdfReader(str(pdf_path))
         print(f"  -> {pdf_path.name}: {len(reader.pages)} pages")
@@ -162,19 +139,15 @@ def _extract_pdf_text(pdf_path: Path) -> str:
             try:
                 t = page.extract_text() or ""
                 if t.strip():
-                    parts.append(t)
+                    text_parts.append(t)
             except Exception as e:
                 print(f"    Skipping page {i+1}: {e}")
     except Exception as e:
         print(f"  ERROR reading {pdf_path.name}: {e}")
-    return "\n".join(parts)
+    return "\n".join(text_parts)
 
 
-def _load_text_chunks(
-    knowledge_dir: Path,
-    chunk_size: int = 700,
-    overlap: int = 120,
-) -> List[str]:
+def _load_text_chunks(knowledge_dir: Path, chunk_size: int = 700, overlap: int = 120) -> List[str]:
     chunks: List[str] = []
     counts = {"txt": 0, "md": 0, "pdf": 0}
 
@@ -198,12 +171,9 @@ def _load_text_chunks(
             _chunk(text)
             counts["pdf"] += 1
         else:
-            print(f"  WARNING: No text from {f.name} — may be scanned/image PDF.")
+            print(f"  WARNING: No text extracted from {f.name} (may be scanned/image PDF).")
 
-    print(
-        f"Loaded {counts['txt']} .txt, {counts['md']} .md, "
-        f"{counts['pdf']} .pdf -> {len(chunks)} total chunks"
-    )
+    print(f"Loaded {counts['txt']} .txt, {counts['md']} .md, {counts['pdf']} .pdf -> {len(chunks)} chunks")
     return chunks
 
 # ── Severity helpers ──────────────────────────────────────────────────────────
@@ -213,7 +183,6 @@ def _coerce_severity(raw: str) -> str:
     if "HIGH" in t: return "HIGH"
     if "MILD" in t: return "MILD"
     return "LOW"
-
 
 async def classify_severity(user_input: str) -> str:
     system = (
@@ -226,7 +195,6 @@ async def classify_severity(user_input: str) -> str:
     )
     return _coerce_severity(await _hf_chat(system, user_input, max_new_tokens=10))
 
-
 def _policy_for_severity(severity: str) -> str:
     if severity == "LOW":
         return (
@@ -236,16 +204,15 @@ def _policy_for_severity(severity: str) -> str:
         )
     if severity == "MILD":
         return (
-            "Offer short coping suggestions. Gently encourage meeting a mental health "
-            "professional soon, without pressure. Avoid framing self-help as sufficient."
+            "Offer short coping suggestions. Gently encourage meeting a mental health professional soon, "
+            "without pressure. Avoid framing self-help as sufficient alone."
         )
     return (
-        "Remain calm and supportive. Strongly advise urgent contact with a licensed "
-        "mental health professional. If there is immediate risk or self-harm concern, "
-        "advise emergency services. "
-        "Indian helplines: iCall 9152987821, Vandrevala 1860-2662-345, NIMHANS 080-46110007."
+        "Remain calm and supportive. Strongly advise urgent contact with a licensed mental health professional. "
+        "If there is immediate risk or self-harm concern, advise emergency services. "
+        "Indian emergency helplines: iCall 9152987821, Vandrevala Foundation 1860-2662-345, "
+        "NIMHANS 080-46110007."
     )
-
 
 def _format_history(messages: List[Message]) -> str:
     return "\n".join(
@@ -255,7 +222,7 @@ def _format_history(messages: List[Message]) -> str:
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
-app = FastAPI(title="OCD RAG Support API", version="2.3.0")
+app = FastAPI(title="OCD RAG Support API", version="2.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -267,13 +234,16 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup_event():
+    # Load embedding model first (downloads ~90 MB on first run, cached after)
+    get_embed_model()
+
     root = Path(__file__).resolve().parent
     kd   = Path(os.getenv("OCD_KNOWLEDGE_DIR", str(root / "ocd_documentation")))
 
     if kd.is_dir():
         chunks = _load_text_chunks(kd)
         if chunks:
-            knowledge_store.build(chunks)
+            knowledge_store.build(chunks)   # synchronous CPU embedding, fast enough
         else:
             print("Warning: no readable files found in knowledge_dir.")
     else:
@@ -304,6 +274,7 @@ async def chat(req: ChatRequest):
     model_severity = await classify_severity(last_user_msg)
     final_severity = _coerce_severity(req.severity) if req.severity else model_severity
 
+    # search() is synchronous CPU — fast on 6k chunks
     context_chunks = knowledge_store.search(last_user_msg, k=4)
     context = "\n".join(context_chunks) if context_chunks else "No specific clinical context available."
     history_text = _format_history(req.messages[:-1])
