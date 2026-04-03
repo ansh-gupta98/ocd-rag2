@@ -1,14 +1,12 @@
 """
-OCD RAG Support – FastAPI backend
-Designed to run within ~1.5 GB RAM on Railway (free/hobby tier).
-
-Retrofit sends:
-  POST /chat     → { session_id, messages: [{role, content}], severity? }
-  POST /summary  → { session_id, messages: [{role, content}] }
+OCD RAG Support – FastAPI backend v2.2
+Fixes:
+  - HF embedding API 410 Gone (api-inference.huggingface.co deprecated)
+  - 6318 chunk startup timeout — embeddings now run locally via sentence-transformers
+  - LLM still calls HF router API (no GPU needed for inference)
 """
 
 import os
-import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import List, Optional
@@ -19,33 +17,37 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import httpx
-
-# pypdf – lightweight, no torch/tesseract needed (~2 MB)
 from pypdf import PdfReader
+from sentence_transformers import SentenceTransformer
 
 load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
-HF_TOKEN        = os.getenv("HUGGINGFACEHUB_API_TOKEN") or os.getenv("HF_TOKEN", "")
-HF_LLM_REPO_ID  = os.getenv("HF_LLM_REPO_ID",  "meta-llama/Llama-3.1-8B-Instruct")
-HF_EMBED_MODEL  = os.getenv("HF_EMBED_MODEL",   "sentence-transformers/all-MiniLM-L6-v2")
+HF_TOKEN       = os.getenv("HUGGINGFACEHUB_API_TOKEN") or os.getenv("HF_TOKEN", "")
+HF_LLM_REPO_ID = os.getenv("HF_LLM_REPO_ID", "meta-llama/Llama-3.1-8B-Instruct")
+# all-MiniLM-L6-v2 is ~90 MB — runs fine on Railway CPU, no GPU needed
+EMBED_MODEL_ID = os.getenv("HF_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 MAX_INPUT_CHARS = 3500
-SEVERITY_LEVELS = {"LOW", "MILD", "HIGH"}
+
+HF_HEADERS = {
+    "Authorization": f"Bearer {HF_TOKEN}",
+    "Content-Type": "application/json",
+}
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
 
 class Message(BaseModel):
-    role: str       # "user" | "assistant"
+    role: str        # "user" | "assistant"
     content: str
 
 class ChatRequest(BaseModel):
     session_id: str
-    messages: List[Message]          # last 10-15 messages from Kotlin
-    severity: Optional[str] = None   # optional override from Kotlin classifier
+    messages: List[Message]
+    severity: Optional[str] = None
 
 class SummaryRequest(BaseModel):
     session_id: str
-    messages: List[Message]          # full or partial history
+    messages: List[Message]
 
 class ChatResponse(BaseModel):
     session_id: str
@@ -59,16 +61,30 @@ class SummaryResponse(BaseModel):
     summary_text: str
     message_count: int
 
-# ── HuggingFace helpers (pure httpx, no LangChain) ────────────────────────────
+# ── Local embedding model (loaded once at startup, ~90 MB) ────────────────────
+# Runs on CPU. No HF API quota consumed for embeddings.
 
-HF_HEADERS = {
-    "Authorization": f"Bearer {HF_TOKEN}",
-    "Content-Type": "application/json",
-}
+_embed_model: Optional[SentenceTransformer] = None
+
+def get_embed_model() -> SentenceTransformer:
+    global _embed_model
+    if _embed_model is None:
+        print(f"Loading local embedding model: {EMBED_MODEL_ID}")
+        _embed_model = SentenceTransformer(EMBED_MODEL_ID)
+        print("Embedding model loaded.")
+    return _embed_model
+
+def embed_texts(texts: List[str]) -> np.ndarray:
+    """Embed a list of texts locally. Returns (N, D) float32 array."""
+    model = get_embed_model()
+    vecs = model.encode(texts, batch_size=64, show_progress_bar=False, normalize_embeddings=True)
+    return np.array(vecs, dtype=np.float32)
+
+# ── HuggingFace LLM helper (remote API) ──────────────────────────────────────
+# Updated to new router.huggingface.co endpoint — api-inference.huggingface.co is deprecated.
 
 async def _hf_chat(system: str, user: str, max_new_tokens: int = 512) -> str:
-    """Call HF Inference API chat endpoint."""
-    url = f"https://api-inference.huggingface.co/models/{HF_LLM_REPO_ID}/v1/chat/completions"
+    url = f"https://router.huggingface.co/hf-inference/models/{HF_LLM_REPO_ID}/v1/chat/completions"
     payload = {
         "model": HF_LLM_REPO_ID,
         "messages": [
@@ -84,45 +100,27 @@ async def _hf_chat(system: str, user: str, max_new_tokens: int = 512) -> str:
         data = resp.json()
     return data["choices"][0]["message"]["content"].strip()
 
-
-async def _hf_embed(texts: List[str]) -> List[List[float]]:
-    """Call HF feature-extraction endpoint for embeddings."""
-    url = f"https://api-inference.huggingface.co/models/{HF_EMBED_MODEL}"
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(url, headers=HF_HEADERS, json={"inputs": texts})
-        resp.raise_for_status()
-    return resp.json()  # list of float vectors
-
-# ── Tiny in-process vector store (replaces FAISS, ~0 overhead) ───────────────
+# ── Tiny local vector store ───────────────────────────────────────────────────
 
 class TinyVectorStore:
     def __init__(self):
         self.chunks: List[str] = []
-        self.matrix: Optional[np.ndarray] = None
+        self.matrix: Optional[np.ndarray] = None   # (N, D) normalized float32
 
     def is_ready(self) -> bool:
         return self.matrix is not None and len(self.chunks) > 0
 
-    async def build(self, chunks: List[str]):
+    def build(self, chunks: List[str]):
+        """Synchronous — called once at startup before the event loop is busy."""
         self.chunks = chunks
-        # HF embedding API has a max batch size — send in batches of 64
-        all_vecs = []
-        batch_size = 64
-        for i in range(0, len(chunks), batch_size):
-            batch = chunks[i : i + batch_size]
-            vecs = await _hf_embed(batch)
-            all_vecs.extend(vecs)
+        print(f"Embedding {len(chunks)} chunks locally (CPU)...")
+        self.matrix = embed_texts(chunks)
+        print(f"Vector store built: {self.matrix.shape}")
 
-        self.matrix = np.array(all_vecs, dtype=np.float32)
-        norms = np.linalg.norm(self.matrix, axis=1, keepdims=True)
-        self.matrix = self.matrix / np.where(norms == 0, 1, norms)
-
-    async def search(self, query: str, k: int = 4) -> List[str]:
+    def search(self, query: str, k: int = 4) -> List[str]:
         if not self.is_ready():
             return []
-        q_vec = await _hf_embed([query])
-        q = np.array(q_vec[0], dtype=np.float32)
-        q = q / (np.linalg.norm(q) or 1.0)
+        q = embed_texts([query])[0]          # already normalized
         scores = self.matrix @ q
         indices = np.argsort(scores)[::-1][:k].tolist()
         return [self.chunks[i] for i in indices]
@@ -133,74 +131,57 @@ knowledge_store = TinyVectorStore()
 # ── Document loaders ──────────────────────────────────────────────────────────
 
 def _extract_pdf_text(pdf_path: Path) -> str:
-    """
-    Extract all text from a PDF using pypdf.
-    Falls back page-by-page and skips unreadable pages gracefully.
-    Works on text-based PDFs (not scanned images — those need OCR).
-    """
     text_parts: List[str] = []
     try:
         reader = PdfReader(str(pdf_path))
         print(f"  -> {pdf_path.name}: {len(reader.pages)} pages")
         for i, page in enumerate(reader.pages):
             try:
-                page_text = page.extract_text() or ""
-                if page_text.strip():
-                    text_parts.append(page_text)
+                t = page.extract_text() or ""
+                if t.strip():
+                    text_parts.append(t)
             except Exception as e:
-                print(f"    Skipping page {i+1} of {pdf_path.name}: {e}")
+                print(f"    Skipping page {i+1}: {e}")
     except Exception as e:
         print(f"  ERROR reading {pdf_path.name}: {e}")
     return "\n".join(text_parts)
 
 
 def _load_text_chunks(knowledge_dir: Path, chunk_size: int = 700, overlap: int = 120) -> List[str]:
-    """
-    Load .txt, .md, and .pdf files from knowledge_dir.
-    Returns a flat list of text chunks for embedding.
-    """
     chunks: List[str] = []
-    file_count = {"txt": 0, "md": 0, "pdf": 0}
+    counts = {"txt": 0, "md": 0, "pdf": 0}
 
-    def _chunk_text(text: str):
+    def _chunk(text: str):
         start = 0
         while start < len(text):
-            end = start + chunk_size
-            chunk = text[start:end].strip()
-            if len(chunk) > 50:
-                chunks.append(chunk)
+            c = text[start : start + chunk_size].strip()
+            if len(c) > 50:
+                chunks.append(c)
             start += chunk_size - overlap
 
-    # Plain text and Markdown
     for ext in ("*.txt", "*.md"):
         for f in knowledge_dir.rglob(ext):
-            text = f.read_text(encoding="utf-8", errors="replace")
-            _chunk_text(text)
-            file_count["txt" if ext == "*.txt" else "md"] += 1
+            _chunk(f.read_text(encoding="utf-8", errors="replace"))
+            counts["txt" if ext == "*.txt" else "md"] += 1
 
-    # PDFs
     for f in knowledge_dir.rglob("*.pdf"):
         print(f"Loading PDF: {f.name}")
-        pdf_text = _extract_pdf_text(f)
-        if pdf_text.strip():
-            _chunk_text(pdf_text)
-            file_count["pdf"] += 1
+        text = _extract_pdf_text(f)
+        if text.strip():
+            _chunk(text)
+            counts["pdf"] += 1
         else:
-            print(f"  WARNING: No text extracted from {f.name}. "
-                  "It may be a scanned/image-only PDF. Convert to .txt manually.")
+            print(f"  WARNING: No text extracted from {f.name} (may be scanned/image PDF).")
 
-    print(
-        f"Loaded {file_count['txt']} .txt, {file_count['md']} .md, "
-        f"{file_count['pdf']} .pdf -> {len(chunks)} total chunks"
-    )
+    print(f"Loaded {counts['txt']} .txt, {counts['md']} .md, {counts['pdf']} .pdf -> {len(chunks)} chunks")
     return chunks
 
 # ── Severity helpers ──────────────────────────────────────────────────────────
 
 def _coerce_severity(raw: str) -> str:
-    text = (raw or "").strip().upper()
-    if "HIGH" in text: return "HIGH"
-    if "MILD" in text: return "MILD"
+    t = (raw or "").strip().upper()
+    if "HIGH" in t: return "HIGH"
+    if "MILD" in t: return "MILD"
     return "LOW"
 
 async def classify_severity(user_input: str) -> str:
@@ -229,22 +210,19 @@ def _policy_for_severity(severity: str) -> str:
     return (
         "Remain calm and supportive. Strongly advise urgent contact with a licensed mental health professional. "
         "If there is immediate risk or self-harm concern, advise emergency services. "
-        "Provide Indian emergency helplines: iCall 9152987821, Vandrevala Foundation 1860-2662-345, "
+        "Indian emergency helplines: iCall 9152987821, Vandrevala Foundation 1860-2662-345, "
         "NIMHANS 080-46110007."
     )
 
-# ── Build conversation context string ─────────────────────────────────────────
-
 def _format_history(messages: List[Message]) -> str:
-    lines = []
-    for m in messages:
-        prefix = "User" if m.role == "user" else "Assistant"
-        lines.append(f"{prefix}: {m.content}")
-    return "\n".join(lines)
+    return "\n".join(
+        f"{'User' if m.role == 'user' else 'Assistant'}: {m.content}"
+        for m in messages
+    )
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
-app = FastAPI(title="OCD RAG Support API", version="2.1.0")
+app = FastAPI(title="OCD RAG Support API", version="2.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -256,16 +234,18 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup_event():
+    # Load embedding model first (downloads ~90 MB on first run, cached after)
+    get_embed_model()
+
     root = Path(__file__).resolve().parent
     kd   = Path(os.getenv("OCD_KNOWLEDGE_DIR", str(root / "ocd_documentation")))
+
     if kd.is_dir():
         chunks = _load_text_chunks(kd)
         if chunks:
-            print(f"Building vector store from {len(chunks)} chunks...")
-            await knowledge_store.build(chunks)
-            print("Vector store ready.")
+            knowledge_store.build(chunks)   # synchronous CPU embedding, fast enough
         else:
-            print("Warning: knowledge_dir exists but no readable files found.")
+            print("Warning: no readable files found in knowledge_dir.")
     else:
         print(f"Warning: knowledge dir not found at {kd}. RAG context will be empty.")
 
@@ -289,14 +269,14 @@ async def chat(req: ChatRequest):
     ).strip()[:MAX_INPUT_CHARS]
 
     if not last_user_msg:
-        raise HTTPException(status_code=400, detail="No user message found in messages list")
+        raise HTTPException(status_code=400, detail="No user message found")
 
     model_severity = await classify_severity(last_user_msg)
     final_severity = _coerce_severity(req.severity) if req.severity else model_severity
 
-    context_chunks = await knowledge_store.search(last_user_msg, k=4)
+    # search() is synchronous CPU — fast on 6k chunks
+    context_chunks = knowledge_store.search(last_user_msg, k=4)
     context = "\n".join(context_chunks) if context_chunks else "No specific clinical context available."
-
     history_text = _format_history(req.messages[:-1])
 
     system = (
@@ -307,7 +287,7 @@ async def chat(req: ChatRequest):
         f"Current severity: {final_severity}\n"
         f"Policy: {_policy_for_severity(final_severity)}\n\n"
         "Rules:\n"
-        "- Always refer to context when relevant\n"
+        "- Refer to context when relevant\n"
         "- Be warm and empathetic\n"
         "- No diagnosis or medication instructions\n"
         "- Max 150 words"
@@ -328,8 +308,6 @@ async def summary(req: SummaryRequest):
     if not req.messages:
         raise HTTPException(status_code=400, detail="messages list is empty")
 
-    history_blob = _format_history(req.messages)
-
     system = (
         "Create a compact doctor-facing session summary for an OCD patient support session.\n"
         "Include:\n"
@@ -344,7 +322,7 @@ async def summary(req: SummaryRequest):
 
     summary_text = await _hf_chat(
         system,
-        f"Session ID: {req.session_id}\n\n{history_blob}",
+        f"Session ID: {req.session_id}\n\n{_format_history(req.messages)}",
         max_new_tokens=600,
     )
 
