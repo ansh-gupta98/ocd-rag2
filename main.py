@@ -30,13 +30,18 @@ load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 HF_TOKEN       = os.getenv("HUGGINGFACEHUB_API_TOKEN") or os.getenv("HF_TOKEN", "")
-HF_LLM_REPO_ID = os.getenv("HF_LLM_REPO_ID", "meta-llama/Llama-3.1-8B-Instruct")
+# Model name — append :provider to pin a fast provider, e.g. "meta-llama/Llama-3.1-8B-Instruct:cerebras"
+# Available fast providers for Llama-3.1-8B: cerebras, groq, novita, fireworks-ai
+HF_LLM_REPO_ID = os.getenv("HF_LLM_REPO_ID", "meta-llama/Llama-3.1-8B-Instruct:cerebras")
 MAX_INPUT_CHARS = 3500
 
 HF_HEADERS = {
     "Authorization": f"Bearer {HF_TOKEN}",
     "Content-Type": "application/json",
 }
+
+# Correct router URL (2025) — model goes in body, not URL path
+HF_CHAT_URL = "https://router.huggingface.co/v1/chat/completions"
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
 
@@ -132,10 +137,11 @@ knowledge_store = TFIDFStore()
 # ── HuggingFace LLM (remote API — no local model needed) ─────────────────────
 
 async def _hf_chat(system: str, user: str, max_new_tokens: int = 512) -> str:
-    url = (
-        f"https://router.huggingface.co/hf-inference/models"
-        f"/{HF_LLM_REPO_ID}/v1/chat/completions"
-    )
+    """
+    Calls router.huggingface.co/v1/chat/completions (OpenAI-compatible).
+    Append :provider to HF_LLM_REPO_ID to pin a fast provider,
+    e.g. "meta-llama/Llama-3.1-8B-Instruct:cerebras"
+    """
     payload = {
         "model": HF_LLM_REPO_ID,
         "messages": [
@@ -146,8 +152,12 @@ async def _hf_chat(system: str, user: str, max_new_tokens: int = 512) -> str:
         "temperature": 0.4,
     }
     async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(url, headers=HF_HEADERS, json=payload)
-        resp.raise_for_status()
+        resp = await client.post(HF_CHAT_URL, headers=HF_HEADERS, json=payload)
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"HF API error {resp.status_code}: {resp.text[:300]}"
+            )
         data = resp.json()
     return data["choices"][0]["message"]["content"].strip()
 
